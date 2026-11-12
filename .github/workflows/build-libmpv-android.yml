@@ -1037,9 +1037,12 @@ jobs:
 
           NL = chr(10)
 
-          # 1. Add delayed_init field
+          # 1. Add delayed_init / init_failed fields
           old1 = "    int operating_rate;" + NL + "} MediaCodecH264DecContext;"
-          new1 = "    int operating_rate;" + NL + "    int delayed_init;" + NL + "} MediaCodecH264DecContext;"
+          new1 = ("    int operating_rate;" + NL +
+                  "    int delayed_init;" + NL +
+                  "    int init_failed;" + NL +
+                  "} MediaCodecH264DecContext;")
           if old1 not in src:
               print("ERROR: cannot find operating_rate in struct")
               sys.exit(1)
@@ -1056,8 +1059,12 @@ jobs:
           new2 = (
               "    if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {" + NL +
               "        /* DELAYED_INIT: configure failed (no valid SPS/PPS in extradata)." + NL +
-              "         * Defer MediaCodec configure until SPS/PPS found in stream data. */" + NL +
+              "         * Defer MediaCodec configure until SPS/PPS found in stream data." + NL +
+              "         * NOTE: ff_mediacodec_dec_init() 的失败路径已经通过 unref 释放了 s->ctx，" + NL +
+              "         * 这里必须先把它置空，否则后面 done: 分支会对已释放的指针再次 av_freep" + NL +
+              "         * （双重释放），并且后续 flush 会解引用悬垂指针。 */" + NL +
               "        av_log(avctx, AV_LOG_INFO, \"MediaCodec configure failed (ret=%d), deferring until SPS/PPS found in stream\\n\", ret);" + NL +
+              "        s->ctx = NULL;" + NL +
               "        s->delayed_init = 1;" + NL +
               "        ret = 0;" + NL +
               "        goto done;" + NL +
@@ -1184,11 +1191,23 @@ jobs:
           old4 = "    /* In delay_flush mode, wait until the user has released or rendered all retained frames. */"
           if old4 in src:
               new4 = (
+                  "    /* DELAYED_INIT: 初始化已判定失败（ctx 已释放且不再重试）时直接报错，" + NL +
+                  "     * 不再走到下面的 flush 分支。 */" + NL +
+                  "    if (s->init_failed || (!s->ctx && !s->delayed_init))" + NL +
+                  "        return AVERROR(EINVAL);" + NL +
+                  "" + NL +
                   "    /* DELAYED_INIT: scan packets for SPS/PPS if not yet configured */" + NL +
                   "    if (s->delayed_init) {" + NL +
                   "        ret = mediacodec_try_delayed_init(avctx, s);" + NL +
-                  "        if (ret < 0)" + NL +
+                  "        if (ret < 0) {" + NL +
+                  "            if (ret != AVERROR(EAGAIN)) {" + NL +
+                  "                /* 不可恢复：try_delayed_init 失败时已把 s->ctx 置空，" + NL +
+                  "                 * 标记后一律返回错误，禁止再进入 flush。 */" + NL +
+                  "                s->init_failed = 1;" + NL +
+                  "                s->delayed_init = 0;" + NL +
+                  "            }" + NL +
                   "            return ret;" + NL +
+                  "        }" + NL +
                   "    }" + NL +
                   "" + NL +
                   "    /* In delay_flush mode, wait until the user has released or rendered all retained frames. */"
@@ -1207,11 +1226,18 @@ jobs:
                   # Insert after the priv_data line
                   line_end4 = src.find(NL, idx4) + 1
                   insert_code = (
-                      "    /* DELAYED_INIT: scan packets for SPS/PPS if not yet configured */" + NL +
+                      "    /* DELAYED_INIT: 初始化已判定失败（ctx 已释放且不再重试）时直接报错 */" + NL +
+                      "    if (s->init_failed || (!s->ctx && !s->delayed_init))" + NL +
+                      "        return AVERROR(EINVAL);" + NL +
                       "    if (s->delayed_init) {" + NL +
                       "        ret = mediacodec_try_delayed_init(avctx, s);" + NL +
-                      "        if (ret < 0)" + NL +
+                      "        if (ret < 0) {" + NL +
+                      "            if (ret != AVERROR(EAGAIN)) {" + NL +
+                      "                s->init_failed = 1;" + NL +
+                      "                s->delayed_init = 0;" + NL +
+                      "            }" + NL +
                       "            return ret;" + NL +
+                      "        }" + NL +
                       "    }" + NL
                   )
                   src = src[:line_end4] + insert_code + src[line_end4:]
@@ -1219,11 +1245,18 @@ jobs:
               else:
                   line_start4 = src.rfind(NL, 0, idx4) + 1
                   insert_code = (
-                      "    /* DELAYED_INIT: scan packets for SPS/PPS if not yet configured */" + NL +
+                      "    /* DELAYED_INIT: 初始化已判定失败（ctx 已释放且不再重试）时直接报错 */" + NL +
+                      "    if (s->init_failed || (!s->ctx && !s->delayed_init))" + NL +
+                      "        return AVERROR(EINVAL);" + NL +
                       "    if (s->delayed_init) {" + NL +
                       "        ret = mediacodec_try_delayed_init(avctx, s);" + NL +
-                      "        if (ret < 0)" + NL +
+                      "        if (ret < 0) {" + NL +
+                      "            if (ret != AVERROR(EAGAIN)) {" + NL +
+                      "                s->init_failed = 1;" + NL +
+                      "                s->delayed_init = 0;" + NL +
+                      "            }" + NL +
                       "            return ret;" + NL +
+                      "        }" + NL +
                       "    }" + NL + NL
                   )
                   src = src[:line_start4] + insert_code + src[line_start4:]
@@ -1272,6 +1305,34 @@ jobs:
           else:
               print("WARNING: cannot find mediacodec_decode_close(avctx) call, skipping")
 
+          # 7. Guard decode_flush：延迟初始化失败后 avctx 仍是 open 状态，
+          #    FFmpeg 的 avcodec_flush_buffers 会无条件调 codec->flush，
+          #    ctx 为空时 ff_mediacodec_dec_flush 会解引用 s->surface(offset 0x18) 崩溃。
+          old7 = (
+              "static void mediacodec_decode_flush(AVCodecContext *avctx)" + NL +
+              "{" + NL +
+              "    MediaCodecH264DecContext *s = avctx->priv_data;" + NL +
+              NL +
+              "    av_packet_unref(&s->buffered_pkt);"
+          )
+          new7 = (
+              "static void mediacodec_decode_flush(AVCodecContext *avctx)" + NL +
+              "{" + NL +
+              "    MediaCodecH264DecContext *s = avctx->priv_data;" + NL +
+              NL +
+              "    /* DELAYED_INIT: 配置失败时 s->ctx 已被释放并置空，这里必须挡掉，*/" + NL +
+              "    /* 否则 ff_mediacodec_dec_flush 会解引用 s->surface(offset 0x18)。 */" + NL +
+              "    if (!s || !s->ctx)" + NL +
+              "        return;" + NL +
+              NL +
+              "    av_packet_unref(&s->buffered_pkt);"
+          )
+          if old7 not in src:
+              print("ERROR: cannot find mediacodec_decode_flush")
+              sys.exit(1)
+          src = src.replace(old7, new7, 1)
+          print("OK: guarded mediacodec_decode_flush against NULL ctx")
+
           with open(f, "w") as fh:
               fh.write(src)
 
@@ -1282,6 +1343,8 @@ jobs:
           assert "mediacodec_try_delayed_init" in verify
           assert "MediaCodec configure failed" in verify
           assert "Delayed init: found SPS" in verify
+          assert "init_failed" in verify
+          assert "if (!s || !s->ctx)" in verify
           print("All verifications passed!")
           PYEOF
 
