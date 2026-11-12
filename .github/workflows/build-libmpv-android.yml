@@ -24,7 +24,6 @@ jobs:
       fail-fast: false
       matrix:
         arch:
-          - { name: arm64-v8a, buildall_arg: arm64 }
           - { name: armeabi-v7a, buildall_arg: armv7l }
 
     steps:
@@ -137,7 +136,7 @@ jobs:
 
           # === 4. Patch ffmpeg.sh ===
           sed -i 's/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2}/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2}/' scripts/ffmpeg.sh
-          sed -i 's/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm --ar=llvm-ar --ranlib=llvm-ranlib --enable-small --optflags=-Os --extra-ldflags=-llog/' scripts/ffmpeg.sh
+          sed -i 's/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm --ar=llvm-ar --ranlib=llvm-ranlib --enable-small --optflags="-Os -g" --extra-ldflags=-llog/' scripts/ffmpeg.sh
 
           # === 4c. Decoder list ===
           # NOTE: --enable-libuavs3d and --enable-libdavs2 are included here
@@ -1963,6 +1962,9 @@ jobs:
         run: |
           cd mpv-android/buildscripts
           export IN_CI=1
+          # 取证构建：与生产相同，仅追加 -g（不改变优化级别与代码布局）
+          export CFLAGS="-g"
+          export CXXFLAGS="-g"
 
           # Verify crossfile.txt will have pthread support
           # (buildall.sh's setup_prefix() was patched in previous step)
@@ -2152,7 +2154,11 @@ jobs:
             exit 1
           fi
 
-          echo "=== Collecting .so from $PREFIX_LIB ==="
+          # 取证构建：strip 前先保存含调试信息的版本
+          mkdir -p "artifacts/${{ matrix.arch.name }}-sym"
+          cp -L "$PREFIX_LIB"/*.so "artifacts/${{ matrix.arch.name }}-sym/" || true
+
+          echo "=== Collecting .so from $PREFIX_LIB ===" 
           for so in "$PREFIX_LIB"/*.so; do
             [ -f "$so" ] || continue
             base=$(basename "$so")
@@ -2309,6 +2315,13 @@ jobs:
         with:
           name: libmpv-cavs-android-${{ matrix.arch.name }}
           path: mpv-android/buildscripts/artifacts/${{ matrix.arch.name }}/
+          retention-days: 7
+
+      - name: Upload unstripped artifacts (symbols)
+        uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-cavs-android-${{ matrix.arch.name }}-sym
+          path: mpv-android/buildscripts/artifacts/${{ matrix.arch.name }}-sym/
           retention-days: 7
 
   release:
