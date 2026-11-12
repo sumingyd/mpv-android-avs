@@ -1419,6 +1419,32 @@ jobs:
           grep -n "if (!s->codec)" "$MCD_COMMON" | head -3
           echo "=== mediacodecdec_common.c patch complete ==="
 
+      - name: Patch mpv vo_mediacodec_embed — no abort when surface already gone
+        # 退出/切后台时 Android Surface 先于 VO 销毁（WinID 变成 0/-1），
+        # mpv 的 embed VO 预初始化会把失败变成 mp_assert → SIGABRT（thread "vo"）。
+        # 改成返回 NULL，复用 preinit 里已有的优雅失败分支。
+        run: |
+          VO="$GITHUB_WORKSPACE/mpv-android/buildscripts/deps/mpv/video/out/vo_mediacodec_embed.c"
+          [ -f "$VO" ] || { echo "ERROR: vo_mediacodec_embed.c not found"; exit 1; }
+          python3 - "$VO" <<'PYEOF'
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          old = "    mp_assert(vo->opts->WinID != 0 && vo->opts->WinID != -1);\n"
+          new = (
+              "    /* SURFACE_GONE: WinID 为 0/-1 说明 Surface 已销毁，此时无法建 embed VO。\n"
+              "       原来这里 mp_assert 会让整个进程 SIGABRT；返回 NULL 交给 preinit 优雅失败。 */\n"
+              "    if (vo->opts->WinID == 0 || vo->opts->WinID == -1)\n"
+              "        return NULL;\n"
+          )
+          if old not in s:
+              print("ERROR: mp_assert anchor not found")
+              sys.exit(1)
+          open(p, "w").write(s.replace(old, new, 1))
+          print("OK: patched vo_mediacodec_embed preinit")
+          PYEOF
+          grep -n "WinID == 0" "$VO" | head -3
+
       - name: Build libuavs3d (AVS3 video decoder library)
         run: |
           cd "$GITHUB_WORKSPACE"
