@@ -67,6 +67,26 @@ jobs:
           cd mpv-android
           git submodule update --init --recursive || true
 
+      - name: Pin third-party sources to the v003 build
+        # 生产库来自 sggc/mpv-android-avs 的 libmpv-cavs-dynamic-v003（2026-10-13 构建），
+        # 当时 mpv / dav1d / libass / libplacebo 都是直接克隆上游 master HEAD，
+        # 不锁定就会随日期漂移，导致 .text 与线上库不一致、符号不能用来定位。
+        # 这里按 v003 构建时刻（2026-10-13T11:22Z）的上游提交预置 deps 目录，
+        # download-deps.sh 见到目录已存在会跳过自己的克隆。
+        run: |
+          cd mpv-android/buildscripts
+          mkdir -p deps
+          pin() {
+            name="$1"; url="$2"; sha="$3"; extra="$4"
+            [ -d "deps/$name" ] || git clone $extra "$url" "deps/$name"
+            git -C "deps/$name" checkout -q "$sha"
+            echo "pinned $name -> $(git -C "deps/$name" rev-parse --short HEAD)"
+          }
+          pin mpv https://github.com/mpv-player/mpv c3ac7f39514c7f45bc38a18e66887240539ee33c ""
+          pin dav1d https://github.com/videolan/dav1d 99f3354ed0b9b4bf3c7c9347318dbcc522c94af5 ""
+          pin libass https://github.com/libass/libass f61db567e6593df3470e91594bcd4ad2d0473aff ""
+          pin libplacebo https://github.com/haasn/libplacebo 1dd022687b9ac1dd996855b51433bf770ae76aab --recursive
+
       - name: Download CAVS patches
         run: |
           mkdir -p cavs_patches
@@ -136,7 +156,11 @@ jobs:
 
           # === 4. Patch ffmpeg.sh ===
           sed -i 's/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2}/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2}/' scripts/ffmpeg.sh
-          sed -i 's/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm --ar=llvm-ar --ranlib=llvm-ranlib --enable-small --optflags="-Os -g" --extra-ldflags=-llog/' scripts/ffmpeg.sh
+          # 与生产构建逐字符一致：--optflags 只保留 -Os。
+          # 调试符号由 configure 默认的 -g 与下面构建步骤导出的 CFLAGS 提供，
+          # 不写进 --optflags，否则会改变内嵌的 configure 串长度，
+          # 使 .rodata 增大 8 字节、.text 整体后移，符号偏移就与线上库对不上了。
+          sed -i 's/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm --ar=llvm-ar --ranlib=llvm-ranlib --enable-small --optflags=-Os --extra-ldflags=-llog/' scripts/ffmpeg.sh
 
           # === 4c. Decoder list ===
           # NOTE: --enable-libuavs3d and --enable-libdavs2 are included here
