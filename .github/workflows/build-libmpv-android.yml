@@ -25,6 +25,7 @@ jobs:
       matrix:
         arch:
           - { name: armeabi-v7a, buildall_arg: armv7l }
+          - { name: arm64-v8a, buildall_arg: arm64 }
 
     steps:
       - name: Checkout repository
