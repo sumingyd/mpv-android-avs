@@ -1351,6 +1351,7 @@ jobs:
             -DBUILD_SHARED_LIBS=ON \
             -DCOMPILE_10BIT=1 \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             ../uavs3d-src
           ninja -j$(nproc)
           ninja install
