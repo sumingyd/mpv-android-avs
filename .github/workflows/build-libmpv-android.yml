@@ -2242,6 +2242,52 @@ jobs:
             exit 1
           fi
 
+          # === Fix versioned SONAME / NEEDED BEFORE copying or stripping ===
+          # 必须在复制到 artifacts（stripped 与 -sym 两份）之前修正 prefix 里的库：
+          # 只修 artifacts/<arch>/ 会漏掉 -sym 产物，单 ABI 构建直接取 -sym 包时
+          # libavcodec.so 的 NEEDED 仍是 libdavs2.so.16，安装后 dlopen 失败。
+          DAVS2_SO="$PREFIX_LIB/libdavs2.so"
+          AVCODEC_SO="$PREFIX_LIB/libavcodec.so"
+          if [ -f "$DAVS2_SO" ]; then
+            OLD_SONAME=$(patchelf --print-soname "$DAVS2_SO" 2>/dev/null || echo "")
+            echo "libdavs2.so current SONAME: '$OLD_SONAME'"
+            if [ "$OLD_SONAME" != "libdavs2.so" ]; then
+              patchelf --set-soname libdavs2.so "$DAVS2_SO"
+              echo "Patched libdavs2.so SONAME -> libdavs2.so"
+            fi
+          else
+            echo "ERROR: libdavs2.so not found in $PREFIX_LIB"
+            exit 1
+          fi
+          if [ -f "$AVCODEC_SO" ]; then
+            NEEDED=$(patchelf --print-needed "$AVCODEC_SO" 2>/dev/null | grep davs2 || echo "")
+            echo "libavcodec.so davs2 NEEDED: '$NEEDED'"
+            if echo "$NEEDED" | grep -q "libdavs2.so.16"; then
+              patchelf --replace-needed libdavs2.so.16 libdavs2.so "$AVCODEC_SO"
+              echo "Patched libavcodec.so NEEDED: libdavs2.so.16 -> libdavs2.so"
+            fi
+          fi
+          UAVS3D_SO="$PREFIX_LIB/libuavs3d.so"
+          if [ -f "$UAVS3D_SO" ]; then
+            OLD_SONAME=$(patchelf --print-soname "$UAVS3D_SO" 2>/dev/null || echo "")
+            echo "libuavs3d.so current SONAME: '$OLD_SONAME'"
+            if [ "$OLD_SONAME" != "libuavs3d.so" ]; then
+              patchelf --set-soname libuavs3d.so "$UAVS3D_SO"
+              echo "Patched libuavs3d.so SONAME -> libuavs3d.so"
+            fi
+          else
+            echo "WARNING: libuavs3d.so not found in $PREFIX_LIB"
+          fi
+          # 复制前断言：任何一份产物都不能再带版本化 davs2 SONAME/NEEDED
+          [ "$(patchelf --print-soname "$DAVS2_SO")" = "libdavs2.so" ] || {
+            echo "ERROR: libdavs2.so SONAME not normalized"
+            exit 1
+          }
+          if patchelf --print-needed "$AVCODEC_SO" 2>/dev/null | grep -q "libdavs2.so.16"; then
+            echo "ERROR: libavcodec.so still NEEDED libdavs2.so.16"
+            exit 1
+          fi
+
           # 取证构建：strip 前先保存含调试信息的版本
           mkdir -p "artifacts/${{ matrix.arch.name }}-sym"
           cp -L "$PREFIX_LIB"/*.so "artifacts/${{ matrix.arch.name }}-sym/" || true
@@ -2281,48 +2327,26 @@ jobs:
             echo "Note: model.bin not found"
           fi
 
-          # === Fix versioned SONAME in libdavs2.so ===
-          DAVS2_SO="artifacts/${{ matrix.arch.name }}/libdavs2.so"
-          AVCODEC_SO="artifacts/${{ matrix.arch.name }}/libavcodec.so"
-          if [ -f "$DAVS2_SO" ]; then
-            OLD_SONAME=$(patchelf --print-soname "$DAVS2_SO" 2>/dev/null || echo "")
-            echo "libdavs2.so current SONAME: '$OLD_SONAME'"
-            if [ "$OLD_SONAME" != "libdavs2.so" ]; then
-              patchelf --set-soname libdavs2.so "$DAVS2_SO"
-              echo "Patched libdavs2.so SONAME -> libdavs2.so"
-            fi
-          fi
-          if [ -f "$AVCODEC_SO" ]; then
-            NEEDED=$(patchelf --print-needed "$AVCODEC_SO" 2>/dev/null | grep davs2 || echo "")
-            echo "libavcodec.so davs2 NEEDED: '$NEEDED'"
-            if echo "$NEEDED" | grep -q "libdavs2.so.16"; then
-              patchelf --replace-needed libdavs2.so.16 libdavs2.so "$AVCODEC_SO"
-              echo "Patched libavcodec.so NEEDED: libdavs2.so.16 -> libdavs2.so"
-            fi
-          fi
-
-          # === Fix libuavs3d.so SONAME if needed ===
-          UAVS3D_SO="artifacts/${{ matrix.arch.name }}/libuavs3d.so"
-          if [ -f "$UAVS3D_SO" ]; then
-            OLD_SONAME=$(patchelf --print-soname "$UAVS3D_SO" 2>/dev/null || echo "")
-            echo "libuavs3d.so current SONAME: '$OLD_SONAME'"
-            if [ "$OLD_SONAME" != "libuavs3d.so" ]; then
-              patchelf --set-soname libuavs3d.so "$UAVS3D_SO"
-              echo "Patched libuavs3d.so SONAME -> libuavs3d.so"
-            fi
-          else
-            echo "WARNING: libuavs3d.so not found in artifacts!"
-            find "$GITHUB_WORKSPACE/mpv-android/buildscripts/prefix" -name "*uavs3d*" -ls 2>/dev/null || true
-          fi
-
           echo "=== Final artifacts ==="
           ls -lh "artifacts/${{ matrix.arch.name }}/"
-          echo "=== SONAME/NEEDED verification ==="
-          for so in "artifacts/${{ matrix.arch.name }}"/*.so; do
-            base=$(basename "$so")
-            soname=$(patchelf --print-soname "$so" 2>/dev/null || echo "N/A")
-            needed=$(patchelf --print-needed "$so" 2>/dev/null | grep davs2 || echo "")
-            echo "  $base: SONAME=$soname  davs2_NEEDED=$needed"
+          echo "=== SONAME/NEEDED verification (both stripped and -sym) ==="
+          for dir in "artifacts/${{ matrix.arch.name }}" "artifacts/${{ matrix.arch.name }}-sym"; do
+            [ -d "$dir" ] || continue
+            for so in "$dir"/*.so; do
+              base=$(basename "$so")
+              soname=$(patchelf --print-soname "$so" 2>/dev/null || echo "N/A")
+              needed=$(patchelf --print-needed "$so" 2>/dev/null | grep davs2 || echo "")
+              echo "  [$dir] $base: SONAME=$soname  davs2_NEEDED=$needed"
+            done
+            # 两份产物都必须能被 Android 直接 dlopen：davs2 不能带版本后缀
+            if [ "$(patchelf --print-soname "$dir/libdavs2.so" 2>/dev/null)" != "libdavs2.so" ]; then
+              echo "::error::[$dir] libdavs2.so SONAME is not libdavs2.so"
+              exit 1
+            fi
+            if patchelf --print-needed "$dir/libavcodec.so" 2>/dev/null | grep -q "libdavs2.so.16"; then
+              echo "::error::[$dir] libavcodec.so still NEEDED libdavs2.so.16"
+              exit 1
+            fi
           done
 
       # ---------------------------------------------------------------------
