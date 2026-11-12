@@ -1262,21 +1262,33 @@ jobs:
                   src = src[:line_start4] + insert_code + src[line_start4:]
                   print("OK: added delayed_init call in receive_frame (before is_flushing)")
 
-          # 5. Patch decode_close
-          # Fuzzy match for decode_close: find 'ff_mediacodec_dec_close(avctx, s->ctx);'
-          close_line = "    ff_mediacodec_dec_close(avctx, s->ctx);"
-          if close_line in src:
-              new_close = (
-                  "    if (s->delayed_init) {" + NL +
-                  "        av_freep(&s->ctx);" + NL +
-                  "    } else {" + NL +
-                  "        ff_mediacodec_dec_close(avctx, s->ctx);" + NL +
-                  "    }"
-              )
-              src = src.replace(close_line, new_close, 1)
-              print("OK: patched decode_close")
-          else:
-              print("WARNING: cannot find decode_close line, skipping")
+          # 5. Patch decode_close：先把 priv_data 里的引用摘掉再释放。
+          #    原来 ff_mediacodec_dec_close() 先释放 s->ctx、随后才 s->ctx = NULL，
+          #    这段时间里如果另一线程走到 mediacodec_decode_flush，就会拿到已释放的 ctx
+          #    （unref 里已把 s->codec 置 NULL），在 ff_AMediaCodec_flush(NULL) 崩溃。
+          #    延迟初始化尚未 configure 成功时底层 codec 未创建，只释放 ctx 壳。
+          old5 = (
+              "    ff_mediacodec_dec_close(avctx, s->ctx);" + NL +
+              "    s->ctx = NULL;"
+          )
+          new5 = (
+              "    /* DELAYED_INIT: 先置空再释放，避免与 flush 线程并发时出现悬垂指针。 */" + NL +
+              "    if (s->ctx) {" + NL +
+              "        MediaCodecDecContext *ctx = s->ctx;" + NL +
+              "        s->ctx = NULL;" + NL +
+              "        if (s->delayed_init) {" + NL +
+              "            /* 从未 configure 成功，codec 未创建，直接释放 ctx 壳 */" + NL +
+              "            av_free(ctx);" + NL +
+              "        } else {" + NL +
+              "            ff_mediacodec_dec_close(avctx, ctx);" + NL +
+              "        }" + NL +
+              "    }"
+          )
+          if old5 not in src:
+              print("ERROR: cannot find decode_close sequence")
+              sys.exit(1)
+          src = src.replace(old5, new5, 1)
+          print("OK: patched decode_close (clear reference before release)")
 
           # 6. Patch done: label to catch ALL init failures (not just ff_mediacodec_dec_init)
           # This catches errors from h264_set_extradata() and other early failures
@@ -1307,7 +1319,9 @@ jobs:
 
           # 7. Guard decode_flush：延迟初始化失败后 avctx 仍是 open 状态，
           #    FFmpeg 的 avcodec_flush_buffers 会无条件调 codec->flush，
-          #    ctx 为空时 ff_mediacodec_dec_flush 会解引用 s->surface(offset 0x18) 崩溃。
+          #    ctx 为空时 ff_mediacodec_dec_flush 会解引用 s->surface(offset 0x18) 崩溃；
+          #    ctx 在、但底层 codec 还没创建（等待 SPS/PPS）时，
+          #    ff_AMediaCodec_flush(NULL) 同样会崩。
           old7 = (
               "static void mediacodec_decode_flush(AVCodecContext *avctx)" + NL +
               "{" + NL +
@@ -1320,9 +1334,8 @@ jobs:
               "{" + NL +
               "    MediaCodecH264DecContext *s = avctx->priv_data;" + NL +
               NL +
-              "    /* DELAYED_INIT: 配置失败时 s->ctx 已被释放并置空，这里必须挡掉，*/" + NL +
-              "    /* 否则 ff_mediacodec_dec_flush 会解引用 s->surface(offset 0x18)。 */" + NL +
-              "    if (!s || !s->ctx)" + NL +
+              "    /* DELAYED_INIT: ctx 已释放（置空）或底层 codec 尚未创建时都没有可 flush 的对象。 */" + NL +
+              "    if (!s || !s->ctx || !s->ctx->codec)" + NL +
               "        return;" + NL +
               NL +
               "    av_packet_unref(&s->buffered_pkt);"
@@ -1331,7 +1344,7 @@ jobs:
               print("ERROR: cannot find mediacodec_decode_flush")
               sys.exit(1)
           src = src.replace(old7, new7, 1)
-          print("OK: guarded mediacodec_decode_flush against NULL ctx")
+          print("OK: guarded mediacodec_decode_flush against NULL ctx/codec")
 
           with open(f, "w") as fh:
               fh.write(src)
@@ -1344,12 +1357,67 @@ jobs:
           assert "MediaCodec configure failed" in verify
           assert "Delayed init: found SPS" in verify
           assert "init_failed" in verify
-          assert "if (!s || !s->ctx)" in verify
+          assert "if (!s || !s->ctx || !s->ctx->codec)" in verify
           print("All verifications passed!")
           PYEOF
 
           python3 /tmp/patch_mcdec.py
           echo "=== mediacodecdec.c patch complete ==="
+
+      - name: Patch mediacodecdec_common.c — guard flush when codec not created
+        run: |
+          cd mpv-android/buildscripts
+          FFMPEG_DIR=""
+          for c in deps/ffmpeg sources/ffmpeg; do
+            [ -d "$c/libavcodec" ] && FFMPEG_DIR="$c" && break
+          done
+          [ -z "$FFMPEG_DIR" ] && FFMPEG_DIR=$(find . -type d -name "ffmpeg" | grep -v ".git" | head -1)
+          MCD_COMMON="$FFMPEG_DIR/libavcodec/mediacodecdec_common.c"
+          [ -f "$MCD_COMMON" ] || { echo "ERROR: mediacodecdec_common.c not found"; exit 1; }
+          echo "=== Patching mediacodecdec_common.c ==="
+
+          cat > /tmp/patch_mcdec_common.py << 'PYEOF'
+          import os, sys
+
+          f = os.environ.get('MCD_COMMON', '')
+          if not f or not os.path.exists(f):
+              print("ERROR: mediacodecdec_common.c missing")
+              sys.exit(1)
+
+          with open(f, "r") as fh:
+              src = fh.read()
+
+          NL = chr(10)
+
+          # DELAYED_INIT: 延迟初始化只分配了 ctx 壳、底层 MediaCodec 还没 configure/start 时，
+          # s->codec 为 NULL，mediacodec_dec_flush_codec() 会调用 ff_AMediaCodec_flush(NULL)
+          # 直接崩溃（4K<->1080 切换时 flush 与延迟初始化重叠）。
+          old = (
+              "int ff_mediacodec_dec_flush(AVCodecContext *avctx, MediaCodecDecContext *s)" + NL +
+              "{" + NL +
+              "    if (!s->surface || !s->delay_flush || atomic_load(&s->refcount) == 1) {"
+          )
+          new = (
+              "int ff_mediacodec_dec_flush(AVCodecContext *avctx, MediaCodecDecContext *s)" + NL +
+              "{" + NL +
+              "    /* DELAYED_INIT: 底层 codec 尚未创建时没有可 flush 的对象，直接返回，*/" + NL +
+              "    /* 不能再往下调用 ff_AMediaCodec_flush(NULL)。 */" + NL +
+              "    if (!s->codec)" + NL +
+              "        return 0;" + NL +
+              NL +
+              "    if (!s->surface || !s->delay_flush || atomic_load(&s->refcount) == 1) {"
+          )
+          if old not in src:
+              print("ERROR: cannot find ff_mediacodec_dec_flush")
+              sys.exit(1)
+          src = src.replace(old, new, 1)
+          open(f, "w").write(src)
+          print("OK: guarded ff_mediacodec_dec_flush against NULL codec")
+          PYEOF
+
+          MCD_COMMON="$MCD_COMMON" python3 /tmp/patch_mcdec_common.py
+          grep -n "if (!s->codec)" "$MCD_COMMON" | head -3
+          echo "=== mediacodecdec_common.c patch complete ==="
 
       - name: Build libuavs3d (AVS3 video decoder library)
         run: |
